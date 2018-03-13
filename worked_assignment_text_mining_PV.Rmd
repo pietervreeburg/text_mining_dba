@@ -1,0 +1,448 @@
+---
+title: "Assignment Text Mining"
+author: "Pieter Vreeburg"
+date: "March 13, 2018"
+output: word_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libs_settings, message = FALSE, warning = FALSE}
+# libs
+library(xml2) # xml parsing
+library(magrittr) # pipe functionality (Tidyverse)
+library(stringr) # string manipulation (Tidyverse)
+library(dplyr) # object manipulation (Tidyverse)
+library(lsa) # contains dutch stopwords
+library(tidytext) # tidy text helpers (Tidyverse)
+library(tidyr) # tidy data helpers (Tidyverse)
+library(topicmodels) # LDA modelling
+library(ggplot2) # plotting (Tidyverse)
+library(forcats) # factor helper (Tidyverse)
+library(wordcloud) # wordclouds
+library(knitr)
+
+# settings
+xml_folder <- 'xml_downloads'
+```
+
+# Preparations
+
+## Download XML
+```{r download_xml, eval = FALSE}
+# get handelingen doc links
+rss_base_url <- 'https://zoek.officielebekendmakingen.nl/rss/handelingen/TK'
+years <- c(2016, 2017)
+meeting_id <- 59 # start at this meeting_id (23-3-2017), last meeting for 2016-2017 is 103 (14-9-2017)
+doc_links <- character()
+for (year in years) {
+  year <- paste(year, year + 1 , sep = '-')
+  print(paste('gather doc_links for:', year))
+  repeat {
+    rss_full_url <- paste(rss_base_url, year, meeting_id, sep = '/')
+    rss <- read_xml(rss_full_url)
+    doc_links_rss <- rss %>% xml_find_all('//link/text()') %>% as_list() %>% unlist()
+    if (length(doc_links_rss[-1]) == 0) {
+      break
+    }
+    print(paste('get doc ids for meeting:', meeting_id))
+    doc_links <- c(doc_links, doc_links_rss[-1])
+    meeting_id <- meeting_id + 1
+  }
+  meeting_id <- 1
+}
+
+# split handelingen detail page links
+doc_ids <- strsplit(doc_links, '/') %>% sapply(tail, 1) %>% strsplit('\\.') %>% sapply(head, 1)
+
+# downloader function, retries failed downloads once, returns doc_id of failed download
+dl_xml <- function(doc_id) {
+  xml_url <- 'https://zoek.officielebekendmakingen.nl/'
+  xml_full_url <- paste0(xml_url, doc_id, '.xml')
+  print(paste('downloading', xml_full_url))
+  xml_file <- download_xml(xml_full_url, file = file.path('.', xml_folder, paste0(doc_id, '.xml')))
+  xml_test <- character()
+  try(xml_test <- suppressWarnings(read_xml(file(xml_file))), silent = TRUE)
+  if (length(xml_test) == 0) { # retry download of 5 sec sleep
+    Sys.sleep(5)
+    xml_file <- download_xml(xml_full_url, file = file.path('.', xml_folder, paste0(doc_id, '.xml')))
+    try(xml_test <- suppressWarnings(read_xml(file(xml_file))), silent = TRUE)
+    if (length(xml_test) == 0) {
+      invisible(file.remove(file.path('.', xml_folder, paste0(doc_id, '.xml')))) # remove failed download
+      return(doc_id)
+    }
+  }
+}
+
+already_downloaded <- list.files(file.path('.', xml_folder)) %>% strsplit('\\.') %>% sapply(head, 1)
+failed_downloads <- character()
+
+for (doc_id in doc_ids) {
+  if (doc_id %in% already_downloaded) {
+    next
+  }
+  else {
+    failed_downloads <- c(failed_downloads, dl_xml(doc_id))
+  }
+}
+```
+
+For this assignment I used the 'handelingen' RSS links to get the URLs of documents which belong to each debate. Om my first try I got some incorrect documents due to a server error at the source. To account for this I wrote a download_xml function which tries to read each downloaded file as xml. If a file is not readable as xml the downloader retries the download. I a download fails a second time the id of the failed download is returned by the downloader.
+
+To save time files downloaded during earlier runs of the script are not downloaded again during later runs.
+
+## Parse XML
+```{r, parse_xml, eval = FALSE}
+# get num spreekbeurten to preallocate memory for df_sb
+xml_filehandles <- list.files(file.path('.', xml_folder))
+num <- 0
+for (handle in xml_filehandles) {
+  xml_content <- read_xml(file.path('.', xml_folder, handle))
+  num <- num + length(xml_find_all(xml_content, '//spreekbeurt'))
+}
+
+# create df_sb
+df_sb <- data_frame(
+  achternaam = character(num),
+  politiek = character(num),
+  tekst = character(num),
+  titel = character(num),
+  file_name = character(num)
+)
+  
+# get data and insert in df_sb
+i <- 1
+for (handle in xml_filehandles) {
+  xml_content <- read_xml(file.path('.', xml_folder, handle))
+  title <- xml_find_first(xml_content, '//item-titel') %>% xml_text()
+  talks <- xml_find_all(xml_content, '//spreekbeurt')
+  for (talk in talks) {
+    speaker <- xml_find_first(talk, 'spreker/naam/achternaam') %>% xml_text()
+    party <- xml_find_first(talk, 'spreker/politiek') %>% xml_text()
+    text <- xml_find_first(talk, 'tekst') %>% xml_text()
+    df_sb[i, ] <- c(speaker, party, text, title, handle)
+    i <- i + 1
+  }
+}
+
+# add jaargang and debat to df_sb, sort df_sb, add spreekbeurt_id
+filenames_split <- strsplit(df_sb$file_name, split = '-')
+df_sb$debat <- as.character(lapply(filenames_split, function (x) {paste(x[3], str_pad(x[4], 3, side = 'left', pad = 0), sep = '-')}))
+df_sb$item <- filenames_split %>% sapply(tail, 1) %>% strsplit('\\.') %>% sapply(head, 1)
+df_sb <- df_sb[order(df_sb$debat, df_sb$item), ]
+df_sb$spreekbeurt_id <- seq(1: nrow(df_sb))
+
+# data cleaning
+# remove punctuation (in some cases punctuation is not directly followed by whitespace which causes incorrect tokenization)
+df_sb$tekst <- df_sb$tekst %>% str_replace_all('[:punct:]', ' ')
+# replace 'Forum voor Democratie' with 'FvD'
+df_sb$politiek <- str_replace(df_sb$politiek, 'Forum voor Democratie', 'FvD')
+
+# save df_sb for later use
+saveRDS(df_sb, 'df_sb.Rds')
+```
+
+As we learned to avoid dynamically growing large objects in R I took a two-step approach to parsing the downloaded xml files. During the first step the script loops through all xml files to count the total number of 'spreekbeurten', this allows the script to directly create a dataframe with the correct dimensions. In the second step the script loops through the xml-files again to parse titles, speaker data and texts. With the receiving dataframe already created indexing is used to store the data parsed in every iteration of the loop.
+
+When all xml files are parsed the filename fields is split into a debate and item field, the dataframe is sorted and a row-id is added. Finally some very limited data-cleaning is done. The resulting dataframe is saved to disk in Rds-format for later use.
+
+## Additional data
+I transformed the provided character-based sentiment data to integer-based data (1 for positive, -1 for negative) to allow for easy sentiment transformations later on.
+
+```{r get_ext_data, echo = TRUE}
+stopwords <- data_frame(stopwords_nl) %>% rename(word = stopwords_nl)
+negation_words <- c('niet', 'geen', 'zonder', 'nooit')
+sentiment_words <- readRDS('sentiment_nl.Rds') %>% select(lemma, sentiment) %>% unique()
+# convert positive sentiment to 1, negative sentiment to -1
+sentiment_words$sentiment %<>% str_replace('positive', '1') %>% str_replace('negative', '-1') %>% as.integer()
+```
+
+# Analysis
+The following paragraphs discuss the results of a sentiment analysis (unigrams and bigrams with negations) and a topic analysis (tf-idf and topic modelling). These paragraphs are always structured as follows:
+
+* Short introduction of the methodology used
+* R code to produce the results
+* Results (presented as a graph if possible)
+* Short discussion of the results
+
+## Sentiment analysis
+
+### Unigrams
+To help with the sentiment analysis I added 3 sentiment variables to the dataframe and wrote a simple `calc_sentiment` function to avoid code duplication. I thought for a while about how to deal with words with both positive and negative sentiment values (as these sentiments would cancel each other out during analysis). As these 'double sentiment' words comprise only 1,5% of all sentiment words, I decided to ignore the issue. I used the `group_by()` function from dplyr to create grouped dataframes to analyse sentiment and objectivity per party, person and debate. Finally I added some code to free up memory used by temporary objects which helped a lot to speed things up on my 4 GB Windows 7 workstation.
+
+Looking at the results I noticed some outliers in the sentiment analysis per person and per debate item. Some House members tend to speak very little in the House and receive very high sentiment scores as a result, for example: Worsdorfer, Laan-Geselschap, Geluk-Poortvliet all receive sentiment scores of + 1. It turns out these members only speak during the mandatory 'Regeling van werkzaamheden' debate item during which the House members set the agenda and decide on other formalities. These debate items also surfaced frequently in the top 10 / bottom 10 debate items with regards to sentiment. This presents 2 problems for analysis:
+
+* The 'backbenchers' who only speak only rarely during House meetings distort the per person ranking with high sentiment ratings based on very little observations.
+* While it is rather interesting in itself that a technical item such as the 'Regeling van werkzaamheden' can receive high sentiment scores (probably due to standard parlance such as '...steun dit voorstel') the title of this debate item is very generic and a top 10 with >5 'Regeling van werkzaamheden' items is not very interesting.
+
+With the above mentioned in mind I decided to redo my analysis with the 'backbenchers' (chosen rather arbitrarily as <= 3 'spreekbeurten') and all items with 'Regeling van werkzaamheden' in the title removed.
+
+```{r sent_unigram, echo = TRUE, message = FALSE}
+df_sb <- readRDS('df_sb.Rds')
+
+# filter # spreekbeurten <= 3 & !'Regeling van werkzaamheden'
+pers_filter <- df_sb %>% group_by(achternaam, debat, item) %>% summarise() %>% group_by(achternaam) %>% count() %>%
+  ungroup() %>% filter(n > 3)
+df_sb <- df_sb %>% filter(achternaam %in% pers_filter$achternaam)
+df_sb <- df_sb[!str_detect(df_sb$titel, regex('.*regeling van werkzaamheden.*', ignore_case = TRUE)), ]
+
+# unnest tokens and remove stopwords
+df_sb_tok <- unnest_tokens(df_sb, word, tekst)
+df_sb_tok <- df_sb_tok %>% anti_join(stopwords)
+
+# add sentiment columns
+df_sb_tok_sent <- left_join(df_sb_tok, sentiment_words, by = c('word' = 'lemma'))
+df_sb_tok_sent$sentiment <- replace_na(df_sb_tok_sent$sentiment, 0)
+df_sb_tok_sent$positive <- df_sb_tok_sent$sentiment == 1
+df_sb_tok_sent$negative <- df_sb_tok_sent$sentiment == -1
+df_sb_tok_sent$neutral <- df_sb_tok_sent$sentiment == 0
+
+# func to calculate sentiment & subjectivity
+calc_sentiment <- function(grouped_df) {
+  df <- summarize(grouped_df, 
+                  sentiment = round((sum(positive) - sum(negative)) / (sum(positive) + sum(negative)), 2),
+                  subjectivity = round((sum(positive) + sum(negative)) / (sum(positive) + sum(negative) + sum(neutral)), 2)
+        ) %>% ungroup()
+}
+
+# sentiment per party
+grouped_party <- df_sb_tok_sent[!is.na(df_sb_tok_sent$politiek), ] %>% group_by(politiek)
+sentiment_party <- calc_sentiment(grouped_party)
+
+#sentiment per person
+grouped_person <- df_sb_tok_sent[!is.na(df_sb_tok_sent$politiek), ] %>% group_by(achternaam, politiek)
+sentiment_person <- calc_sentiment(grouped_person)
+
+#sentiment per debate item
+grouped_debate <- df_sb_tok_sent[!is.na(df_sb_tok_sent$titel), ] %>% group_by(debat, item, titel) %>% 
+  filter(sum(positive) > 10 & sum(negative) > 10)
+sentiment_debate <- calc_sentiment(grouped_debate)
+
+# clean up
+rm(grouped_party, grouped_person, grouped_debate, df_sb_tok_sent)
+invisible(gc())
+
+# plot sentiment per party
+# reorder levels for plot
+sentiment_party$politiek <- as_factor(sentiment_party$politiek) %>% fct_reorder(sentiment_party$sentiment)
+# gather to long format
+sentiment_party %<>% gather(key, value, 2:3) %>% arrange(key, desc(value))
+# plot
+plot_party <- ggplot(sentiment_party, aes(politiek, value)) + geom_col() + facet_wrap(~key, scales = 'free_x') + theme_bw() + 
+  coord_flip() + labs(title = 'Fig. 1: sentiment and subjectivity per political party', 
+                      y = 'Score', x = 'Party')
+
+# plot sentiment per person
+# get top 10 (incl. ties) & bottom 10 (incl. ties) from sentiment_person
+sentiment_person_top <- sentiment_person %>% top_n(10, sentiment) %>% rbind(top_n(sentiment_person, -10, sentiment))
+sentiment_person_top$name_party <- paste0(sentiment_person_top$achternaam, ' (', sentiment_person_top$politiek, ')')
+sentiment_person_top$name_party <- as_factor(sentiment_person_top$name_party) %>% fct_reorder(sentiment_person_top$sentiment)
+sentiment_person_top %<>% select(5, 3, 4) %>% gather(key, value, 2:3) %>% arrange(key, desc(value))
+
+plot_person <- ggplot(sentiment_person_top, aes(name_party, value)) + geom_col() + facet_wrap(~key, scales = 'free_x') + 
+  theme_bw() + coord_flip() + labs(title = 'Fig. 2: top 10 / bottom 10 (incl. ties) per person)', 
+                                  y = 'Score', x = 'Person (party)')
+
+# top 10 / bottom 10 sentiment debate items (incl. ties)
+pos_debate_top_10 <- sentiment_debate %>% top_n(10, sentiment) %>% select (3:5) %>% arrange(desc(sentiment)) %>% 
+  rename('title' = 'titel')
+neg_debate_top_10 <- sentiment_debate %>% top_n(-10, sentiment) %>% select (3:5) %>% arrange(sentiment) %>%
+  rename('title' = 'titel')
+```
+
+Figure 1 below displays the sentiment and subjectivity scores per political party, sorted in descending order on sentiment. Surprisingly enough all parties end up with a positive sentiment score. While the Dutch are sometimes viewed as a grumpy people who always know something to nag about, this clearly does not extend to the Dutch House of Representatives. Parties viewed as 'tegenpartijen' (FvD, PVV, DENK, SP, PvdD, 50Plus) get lower sentiment values, but the total sentiment score for these parties is still positive. The smaller Christian parties (SGP and ChristenUnie) are among the most positive parties. Parties do not differ much with regards to subjectivity.
+
+```{r, echo = FALSE}
+plot_party
+```
+
+Figure 2 below displays the top 10 and bottom 10 members (incl. ties) of the House of Representatives with regards to sentiment. Members of the VVD party feature often in the top 10, members of the 'tegenpartijen' (mainly PVV) feature often in the bottom 10. The spread in the subjectivity-score is somewhat larger than in figure 1.
+
+```{r, echo = FALSE}
+plot_person
+```
+
+Tables 1 and 2 below display the top 10 and bottom 10 debate items (incl. ties) with regards to sentiment. Especially with the negative items the technique seems to work rather well. 
+
+`r kable(pos_debate_top_10, caption = 'Table 1: top 10 positive debate items')`
+
+`r kable(neg_debate_top_10, caption = 'Table 2: top 10 negative debate items')`
+
+### Bigrams with negation
+The methodology used for this part of the analysis is largely the same as described above, with the added functionality to 'flip' negated sentiment values (if the first word of the bigram is a negation word the sentiment value of the second word of the bigram is flipped from -1 to 1 - or vice-versa).
+
+```{r sent_bigram, echo = TRUE, message = FALSE}
+# unnest bigrams, remove stopwords, add sentiment words, and flip negated sentiment words
+df_sb_bigr <- unnest_tokens(df_sb, bigram, tekst, token = 'ngrams', n = 2)
+df_sb_bigr_sent <- df_sb_bigr %>% separate(bigram, c('word_1', 'word_2'), sep = ' ') %>% 
+                    anti_join(stopwords, by = c('word_2' = 'word')) %>%
+                    left_join(sentiment_words, by = c('word_2' = 'lemma')) %>%
+                    mutate(sentiment_neg = (- 2 * word_1 %in% negation_words + 1) * sentiment)
+# add sentiment columns
+df_sb_bigr_sent$sentiment_neg <- replace_na(df_sb_bigr_sent$sentiment_neg, 0)
+df_sb_bigr_sent$positive <- df_sb_bigr_sent$sentiment_neg == 1
+df_sb_bigr_sent$negative <- df_sb_bigr_sent$sentiment_neg == -1
+df_sb_bigr_sent$neutral <- df_sb_bigr_sent$sentiment_neg == 0
+
+# sentiment per party
+grouped_party <- df_sb_bigr_sent[!is.na(df_sb_bigr_sent$politiek), ] %>% group_by(politiek)
+sentiment_party <- calc_sentiment(grouped_party)
+
+#sentiment per person
+grouped_person <- df_sb_bigr_sent[!is.na(df_sb_bigr_sent$politiek), ] %>% group_by(achternaam, politiek)
+sentiment_person <- calc_sentiment(grouped_person)
+
+#sentiment per debate item
+grouped_debate <- df_sb_bigr_sent[!is.na(df_sb_bigr_sent$titel), ] %>% group_by(debat, item, titel) %>% 
+  filter(sum(positive) > 10 & sum(negative) > 10)
+sentiment_debate <- calc_sentiment(grouped_debate)
+
+#clean up
+rm(grouped_party, grouped_person, grouped_debate, df_sb_bigr, df_sb_bigr_sent)
+invisible(gc())
+
+# plot sentiment per party
+# reorder levels for plot
+sentiment_party$politiek <- as_factor(sentiment_party$politiek) %>% fct_reorder(sentiment_party$sentiment)
+# gather to long format
+sentiment_party %<>% gather(key, value, 2:3) %>% arrange(key, desc(value))
+# plot
+plot_party <- ggplot(sentiment_party, aes(politiek, value)) + geom_col() + facet_wrap(~key, scales = 'free_x') + theme_bw() +
+  coord_flip() + labs(title = 'Figure 3: sentiment and subjectivity per political party', 
+                      y = 'Score', x = 'Party')
+
+# plot sentiment per person
+# get top 10 (incl. ties) & bottom 10 (incl. ties) from sentiment_person
+sentiment_person_top <- sentiment_person %>% top_n(10, sentiment) %>% rbind(top_n(sentiment_person, -10, sentiment))
+sentiment_person_top$name_party <- paste0(sentiment_person_top$achternaam, ' (', sentiment_person_top$politiek, ')')
+sentiment_person_top$name_party <- as_factor(sentiment_person_top$name_party) %>% 
+                                    fct_reorder(sentiment_person_top$sentiment)
+sentiment_person_top %<>% select(5, 3, 4) %>% gather(key, value, 2:3) %>% arrange(key, desc(value))
+
+plot_person <- ggplot(sentiment_person_top, aes(name_party, value)) + geom_col() + facet_wrap(~key, scales = 'free_x') + 
+  theme_bw() + coord_flip() + labs(title = 'Figure 4: sentiment and subjectivity per person (top 10 / bottom 10 (incl. ties))', 
+                      y = 'Score', x = 'Person (party)')
+
+# top 10 / bottom 10 sentiment debate items (incl. ties)
+pos_debate_top_10_bigr <- sentiment_debate %>% top_n(10, sentiment) %>% select (3:5) %>% arrange(desc(sentiment)) %>%
+  rename('title' = 'titel')
+
+neg_debate_top_10_bigr <- sentiment_debate %>% top_n(-10, sentiment) %>% select (3:5) %>% arrange(sentiment) %>%
+  rename('title' = 'titel')
+
+# clean up
+rm(sentiment_party, sentiment_person, sentiment_person_top, sentiment_debate)
+invisible(gc())
+```
+
+Figure 3 below displays the sentiment and subjectivity scores per political party, sorted in descending order on sentiment. Working with bigrams (with negation) does not add much to the analysis in this case.
+
+```{r, echo = FALSE}
+plot_party
+```
+
+Figure 4 below displays the top 10 and bottom 10 members (incl. ties) of the House of Representatives with regards to sentiment. Using bigrams (with negation) changes the positions of the top 10 / bottom 10 rankings a bit (Hiddema and Fritsma change places in the bottom 10), but the overall image remains the same.
+
+```{r, echo = FALSE}
+plot_person
+```
+
+Tables 3 and 4 below display the top 10 and bottom 10 debate items (incl. ties) with regards to sentiment. The items listed in both tables are more or less the same, the ordering has changed around a bit. An interesting newcomer in the table 4 is the 'Fokuswonen' debate item as the third most negative item which contains a lot of negated positive sentiment words (niet goed, geen zorg, etc.)
+
+`r kable(pos_debate_top_10_bigr, caption = 'Table 3: top 10 positive debate items')`
+
+`r kable(neg_debate_top_10_bigr, caption = 'Table 4: top 10 negative debate items')`
+
+Using bigrams (with negation) apparently does not add much to the analysis, however, it is not much more complicated or computationally expensive than using unigrams while it adds some additional precision. Everything considered I expect to use bigrams with negation in the future when employing this technique.
+
+## Topics
+
+### Most characteristic words per political party
+The methodology used in this part of the analysis is rather straightforward. While working on this assignment I got a lot of hands-on experience with the split-apply-combine strategy as implemented in the `Tidyverse` packages. It is interesting to see how a lot of transformations can be done in a single line of code. 
+
+```{r tf_idf, echo = TRUE, message = FALSE}
+df_sb_tok$politiek %<>% replace_na('geen_tk_lid')
+# calc tf-idf
+party_words <- df_sb_tok %>% count(politiek, word) %>% bind_tf_idf(word, politiek, n)
+# top 15 per party
+top_5_party_words <- party_words %>% group_by(politiek) %>% top_n(5, tf_idf) %>% arrange(politiek, desc(tf_idf)) %>%
+  ungroup()
+
+# clean_up
+rm(party_words)
+invisible(gc())
+
+#wordcloud
+basecolors <- rainbow(length(unique(top_5_party_words$politiek)))
+colorlist <- basecolors[match(top_5_party_words$politiek, unique(top_5_party_words$politiek))]
+```
+
+A word cloud is an interesting way to plot a selection of words. In the word cloud below I plotted the 5 most characteristic words per political party. The tf-idf score controls the size of the words and the party-variable maps to colors of the word cloud. Unfortunately the word cloud package does not provide functionality to add a legend, reducing the usefulness of the visualization.
+
+```{r}
+wordcloud(top_5_party_words$word, top_5_party_words$tf_idf, colors = colorlist, ordered.colors = TRUE)
+```
+
+Table 5 below displays the same data as a table, which is probably more useful in this case. Overall the technique seems to work rather well. When I Googled findings which seemed strange at first sight ('ehrm' for PVV, 'implantaten' for CDA and '137d' for FvD) I immediately found press releases from the parties concerned related to those specific words ('Debat over EHRM dat nationale wetgeving doorkruist' for PVV, 'CDA wil meldpunt voor bijwerkingen implantaten' for CDA and 'Vrijheid van Meningsuiting - Daar teken ik voor!' from FvD which is about article 137d from the Dutch Penal Law). The technique is rather sensitive is seemingly rather sensitive for spelling mistakes in the source text, such as 'devoorzitter' for GroenLinks.
+
+`r kable(top_5_party_words, caption = 'Table 5: top 5 common words per political party')`
+
+### Topic modelling
+The implementation of Topic modelling for this assignment is also rather straightforward. After adding a `doc` variable to the data set (to keep the debate items from the different debates separated in the DTM) I used the idf-measure to collect some additional stopwords which are specific to this domain (voorzitter, minister, party names, etc). These additional stopwords are removed from the tokenized dataframe. The reduced dataframe is then cast as a document term matrix (as an aside: we had to create a DTM by hand for the programming course earlier in the year, I wish I knew about this functionality then). The new DTM is then fed into the LDA algorithm.
+
+```{r topic_model_item, echo = TRUE, message = FALSE}
+# get domain specific stopwords
+df_sb_tok %<>% mutate(doc = paste0(debat, '_', item))
+stopwords_extra <- df_sb_tok %>% count(doc, word) %>% bind_tf_idf(word, doc, n) %>% 
+  distinct(idf, word) %>% top_n(-100, idf)
+# remove domain spec stopswordsa
+df_sb_tok_extra <- df_sb_tok %>% anti_join(stopwords_extra)
+# cast dtm and fit LDA model
+item_dtm <- df_sb_tok_extra %>% count(doc, word) %>% cast_dtm(doc, word, n)
+# item_lda <- LDA(item_dtm, k = 20, control = list(seed = 1234))
+item_lda <- readRDS('item_lda.Rds') # avoid redoing the LDA again
+
+# plot top 10 topic words
+topic_words <- tidy(item_lda, matrix = 'beta')
+top_topic_words <- topic_words %>% group_by(topic) %>% top_n(10, beta) %>%
+  ungroup() %>% arrange(topic, desc(beta))
+top_topic_words$term <- as_factor(top_topic_words$term) %>% fct_reorder(top_topic_words$beta)
+top_topic_words_plot <- ggplot(top_topic_words, aes(term, beta, fill = factor(topic))) + geom_col(show.legend = FALSE) + 
+  facet_wrap(~ topic, scales = "free") + coord_flip() + theme_bw() + 
+  labs(title = 'Figure 5: top 10 words per topic', x = 'Term', y = 'Beta')
+
+# plot topic timeline
+topic_docs <- tidy(item_lda, matrix = 'gamma') %>% filter(document != 'NA_NA') %>% group_by(document) %>% top_n(1, gamma) %>%
+  separate(document, c('debate', 'item'), sep = '_', remove = FALSE) %>% arrange(debate, as.integer(item))
+avg_gamma <- topic_docs %>% group_by(debate) %>% summarize(avg_gamma = mean(gamma))
+topic_docs <- inner_join(topic_docs, avg_gamma)
+topic_docs$seq <- seq(1:nrow(topic_docs))
+
+topic_docs_plot <- ggplot(topic_docs, aes(seq, avg_gamma, fill = factor(topic))) + geom_col() + theme_bw() +
+  labs(title = 'Figure 6: Topic timeline', x = 'Index', y = 'Gamma')
+```
+
+It is interesting to see how well some topics are captured by the LDA algorithm, most topics are rather clearly separated from the other topics (Groningen, Europa, landbouw, energie (incl. duurzaamheid), arbeidsmarkt, democratie (incl. referenda), defensie, etc.). Some words (especially 'staatssecretaris') surface in many topics and muddy the waters a bit. It would probably be advisable to remove these non-topical words from the data set and redo the analysis to get additional separation between topics (which I won't do in this case due to time constraints). 
+
+Figure 5 below displays the top 10 words per topic (the ordering of the terms by beta per topic is not entirely high-low - for example in topic 2 - due to the ordering of the individual factor levels in the underlying dataframe. I have as of yet not been able to get GGPlot to produce an ordered plot for a character vector).
+
+```{r}
+top_topic_words_plot
+```
+
+Figure 6 below displays a timeline of the topics per debate item. This plot displays a problem with the current analysis as a large part of the documents (`r sum(topic_docs$topic==11)`) end up in Topic 11 which is a very non-distinctive topic. 
+
+```{r}
+topic_docs_plot
+```
+
+# Summary and reflection
+For this assignment I used a several text mining techniques to analyse the debates conducted in the Dutch House of Representatives from march 2017 until now. It was interesting to see how many different and interesting results could be produced using these techniques. I was able to entertain a group of friends for an evening by sharing small tidbits of fun and / or 'shocking' results when they became available. I was surprised for example by the fact that a number of House members do not contribute actively to any debate (but are accounted for in the 'Regeling van werkzaamheden'), what is it these members actually do? I was surprised at the overall positivism during the debates, for all parties the number of positive sentiment words used in the various debates far outweigh the number of negative words used. Even the parties I tend to view as rather negative (PVV, FvD, etc.) display a rather positive sentiment. Maybe it is time to rethink my preconceived notions about some political parties.
+
+During this assignment I realized it could be very interesting to redo this analysis on the election programmes of several parties running in the upcoming municipal elections (probably for the municipality of Rotterdam as I live close by), the results could then be displayed in an online dashboard for everybody to consult as part of their preparations for voting day. If I have some time to spare in the upcoming weeks (a very big if) I will try my hand at this.
+
+During this course I learned some new techniques and learned how to implement some techniques I already knew in R. For my work I have already implemented several scrapers/ parsers in Python. It is interesting to compare how similar things can be done in different languages. For example: string method chaining in Python (to split strings into several components) is more or less equivalent to piping function output in R. I think Python is the better option for me when building the data collection and manipulation pipeline, R could certainly play an important role when doing the actual analysis.
+
+The text-analysis techniques were all new for me: especially the TF-IDF technique is something I can probably put to use in a work-related context. I also got a lot more practice with the Tidyverse packages (the details of `gather` eluded me until now :-) and the usefulness of the `pipe` functionality to interactively build complex queries.
